@@ -1,0 +1,15 @@
+# --- Core Inference ---
+onnxruntime       
+onnxscript
+opencv-python
+numpy
+Pillow
+ultralytics
+
+# --- BentoML Serving ---
+bentoml==1.4.28
+
+# --- Utilities ---
+requests
+tqdm
+

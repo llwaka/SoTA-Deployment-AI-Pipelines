@@ -13,15 +13,25 @@ For the evaluations, a coco-dataset will be used.
 
 ## Procedure
 - Run the YOLO11 model deployed as service using bentoml.
-- Record system performance () on hardware of choice (GPU or CPU).
-- Draw your analysis for:
+   - Note: Ensure correct setting of the onnxruntime provider. Commands: ``import onnxruntime as ort``and ``print("Available ONNX Runtime Execution Providers:", available_providers)``
+- Print system performance (latency and throughput for the scenarios) on CPU.
+- Interprete the results.
+- Optinal: make changes and run on GPU
 
 
 ## Running the code
 1. Using Python/conda virtual environment
+   - Clone repository
    - Create the virtual environment, activate it and install dependencies specified in requirements.txt
-   - On terminal, run commands
-   - 
+   - Open two terminals and
+      - on one terminal, run bento server with command ``bentoml serve``
+      - on the other terminal, run benchmark file e.g., ``python benchmark.py --folder "data/coco-dataset/val2017" --sizes 20 100 300 500 ``
+   
 2. Using Docker
-   - 
+   - Clone repository
+   - Build docker image: ``docker build -t yolo11-bento .``
+   - Run BentoML service: ``docker run -p 3000:3000 yolo11-bento``
+   - Run benchmark file inside the container: `` docker run --rm yolo11-bento \
+    python benchmark.py --folder data/coco-dataset/val2017 --url http://host.docker.internal:3000/detect``
+
   
