@@ -1,105 +1,158 @@
-import bentoml
-import cv2
-from ultralytics import YOLO
+import time
+import asyncio
+import aiohttp
+import requests
 import numpy as np
-import onnxruntime as ort
-from PIL import Image as PILImage
+from pathlib import Path
+from PIL import Image
+import io
+import argparse
+import sys
 
-# YOLO model
-model_org = YOLO("yolo11s.pt")
-model_org.export(format="onnx", nms=True, task="detect")  # Export to ONNX with NMS
+# -------------------------------------------------------------
+# Utilities
+# -------------------------------------------------------------
 
-# Preprocessing (YOLO)
-def letterbox(img, size=640):
-    """Resize + pad image while keeping aspect ratio (Ultralytics style)."""
-    h, w = img.shape[:2]
-    scale = size / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
+def load_images(folder, max_images=5000):
+    paths = list(Path(folder).glob("*.*"))
+    paths = paths[:max_images]
+    images = []
+    for p in paths:
+        try:
+            images.append(Image.open(p).convert("RGB"))
+        except:
+            pass
+    return images
 
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    pad_w, pad_h = size - new_w, size - new_h
-    top, bottom = pad_h // 2, pad_h - (pad_h // 2)
-    left, right = pad_w // 2, pad_w - (pad_w // 2)
+def image_to_bytes(image):
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG")
+    buf.seek(0)
+    return buf.getvalue()
 
-    img_padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT)
-    return img_padded, scale, (left, top)
+# -------------------------------------------------------------
+# Single Stream Latency Test
+# -------------------------------------------------------------
 
-def preprocess(image: PILImage.Image, size=640):
-    """Convert PIL → padded tensor of shape [1,3,H,W]."""
-    img = np.array(image.convert("RGB"))
-    img_lb, scale, pad = letterbox(img, size=size)
-    img_chw = img_lb[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
-    return img_chw[np.newaxis, ...], img.shape, scale, pad
+def single_stream_latency(url, image, iterations=200):
+    img_bytes = image_to_bytes(image)
+    latencies = []
 
-def scale_box(box, scale, pad):
-    """Scale YOLO padded detection box back to original image size."""
-    x1, y1, x2, y2 = box
-    x1, y1 = (x1 - pad[0]) / scale, (y1 - pad[1]) / scale
-    x2, y2 = (x2 - pad[0]) / scale, (y2 - pad[1]) / scale
-    return [x1, y1, x2, y2]
+    print("\n=== Running Single Stream Latency Benchmark ===")
 
-# Bentoml Service
-@bentoml.service(name= "Object_Detection_Service")
-class YOLO11Service:
-    
-    def __init__(self):
-        # Load the model and convert to ONNX format with NMS
-        super().__init__()
-        self.model_path= "yolo11s.onnx"
-        
-        # Detect provider. Notice on GPU enabled machines, CUDAExecutionProvider will be used. Also, remember to use onnxruntime-gpu package.
-        available_providers = ort.get_available_providers() # Available ONNX Runtime Execution Providers
-        
-        providers = [
-            p for p in available_providers 
-            if p in ('CPUExecutionProvider')] # Others:'CUDAExecutionProvider', 'CoreMLExecutionProvider',
+    # Warmup
+    for _ in range(5):
+        requests.post(url, files={"image": ("warmup.jpg", img_bytes, "image/jpeg")})
 
-        # Create ONNX Runtime Inference Session
-        self.session = ort.InferenceSession(self.model_path, providers=providers) # Session is tha actual object used to run inference. The model is loaded once at service startup.
-        self.input_name = self.session.get_inputs()[0].name # the name of model's input tensor
+    # Actual test
+    for _ in range(iterations):
+        start = time.perf_counter()
+        r = requests.post(url, files={"image": ("img.jpg", img_bytes, "image/jpeg")})
+        r.raise_for_status()
+        latencies.append((time.perf_counter() - start) * 1000)
 
-    @bentoml.api
-    async def detect(self, image: PILImage.Image) -> dict:
-        
-        """ YOLO11s ONNX detection API using built-in NMS. Ultralytics ONNX (nms=True) outputs: [num_dets, 6] → [x1, y1, x2, y2, conf, class_id] """
-        # Preprocess the input image
-        input_tensor, original_shape, scale, pad = preprocess(image) #        
-        # Run inference
-        outputs = self.session.run(None, {self.input_name: input_tensor})
-        detections = outputs[0]  # Model outputs with built-in NMS. shape: [num_dets, 6]
-        
-        # Postprocess the outputs
-        results = []
-        for det in detections:
-          
-            # Convert any nested structure to flat list of floats
-            flat_det = []
+    latencies = np.array(latencies)
 
-            for d in det[:6]:  # first 6 elements: x1, y1, x2, y2, conf, cls_id
-                # If it's a numpy array, flatten and take first element
-                if isinstance(d, np.ndarray):
-                    flat_det.extend(d.flatten().tolist())
-                # If it's a list, flatten recursively
-                elif isinstance(d, list):
-                    flat_det.extend(np.array(d).flatten().tolist())
-                else:  # already a scalar
-                    flat_det.append(float(d))
+    results = {
+        "iterations": iterations,
+        "avg_ms": float(latencies.mean()),
+        "p50_ms": float(np.percentile(latencies, 50)),
+        "p90_ms": float(np.percentile(latencies, 90)),
+        "p99_ms": float(np.percentile(latencies, 99)),
+        "min_ms":  float(latencies.min()),
+        "max_ms":  float(latencies.max()),
+    }
 
-            # Take first 6 values safely
-            x1, y1, x2, y2, conf, cls_id = flat_det[:6]
+    print("=== Single Stream Latency Results ===")
+    for k, v in results.items():
+        print(f"{k}: {v}")
 
-            box = scale_box([x1, y1, x2, y2], scale, pad)
+    return results
 
-            results.append({
-                "box": box,
-                "confidence": float(conf),
-                "class_id": int(cls_id)
-            })
-            
-        return {"detections": results}
-        
-# Create a BentoML service instance
-yolo11_service = YOLO11Service()
+# -------------------------------------------------------------
+# Concurrency Scaling Test
+# -------------------------------------------------------------
 
+async def run_worker(url, img_bytes, iterations):
+    lat = []
+    async with aiohttp.ClientSession() as session:
+        for _ in range(iterations):
+            start = time.perf_counter()
+            async with session.post(url, data={"image": img_bytes}) as resp:
+                await resp.read()
+            lat.append((time.perf_counter() - start) * 1000)
+    return lat
 
+async def concurrency_test(url, image, concurrency, iterations):
+    img_bytes = image_to_bytes(image)
 
+    workers = [run_worker(url, img_bytes, iterations) for _ in range(concurrency)]
+    results = await asyncio.gather(*workers)
+    latencies = np.concatenate(results)
+
+    total_requests = concurrency * iterations
+    tot_sec = np.sum(latencies) / 1000
+
+    out = {
+        "concurrency": concurrency,
+        "iterations_per_worker": iterations,
+        "total_requests": total_requests,
+        "throughput_img_per_sec": total_requests / tot_sec,
+        "avg_ms": float(latencies.mean()),
+        "p90_ms": float(np.percentile(latencies, 90)),
+        "p99_ms": float(np.percentile(latencies, 99)),
+    }
+
+    print(f"\n=== Concurrency = {concurrency} ===")
+    for k, v in out.items():
+        print(f"{k}: {v}")
+
+    return out
+
+# -------------------------------------------------------------
+# Main Benchmark Runner
+# -------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folder", required=True, help="Folder with images (COCO val2017)")
+    parser.add_argument("--url", default="http://localhost:3000/detect")
+    parser.add_argument("--single_iter", type=int, default=200)
+    parser.add_argument("--concurrency_levels", nargs="+", type=int, default=[1, 2, 4, 8])
+    parser.add_argument("--concurrency_iter", type=int, default=50)
+    args = parser.parse_args()
+
+    # Load dataset
+    images = load_images(args.folder)
+    if len(images) == 0:
+        print("No images loaded.")
+        sys.exit(1)
+
+    # Single fixed image for fair comparison
+    image = images[0]
+    print(f"Loaded 1 image for testing from dataset: {args.folder}")
+
+    # ---------------- Single Stream -------------------
+    single_results = single_stream_latency(
+        url=args.url,
+        image=image,
+        iterations=args.single_iter
+    )
+
+    # ---------------- Concurrency ---------------------
+    print("\n=== Running Concurrency Scaling Benchmark ===")
+    all_concurrency_results = []
+
+    for c in args.concurrency_levels:
+        res = asyncio.run(
+            concurrency_test(
+                url=args.url,
+                image=image,
+                concurrency=c,
+                iterations=args.concurrency_iter
+            )
+        )
+        all_concurrency_results.append(res)
+
+if __name__ == "__main__":
+    main()
