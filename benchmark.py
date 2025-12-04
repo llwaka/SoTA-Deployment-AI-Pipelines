@@ -1,116 +1,158 @@
 import time
-import json
-import argparse
+import asyncio
+import aiohttp
 import requests
+import numpy as np
 from pathlib import Path
 from PIL import Image
 import io
-import numpy as np
+import argparse
+import sys
 
+# -------------------------------------------------------------
+# Utilities
+# -------------------------------------------------------------
 
-def load_images(folder, max_images=500):
+def load_images(folder, max_images=5000):
+    paths = list(Path(folder).glob("*.*"))
+    paths = paths[:max_images]
     images = []
-    for p in Path(folder).glob("*.*"):
-        if len(images) >= max_images:
-            break
+    for p in paths:
         try:
-            img = Image.open(p).convert("RGB")
-            images.append(img)
+            images.append(Image.open(p).convert("RGB"))
         except:
             pass
     return images
 
-def image_to_bytes(img):
+def image_to_bytes(image):
     buf = io.BytesIO()
-    img.save(buf, format="JPEG")
+    image.save(buf, format="JPEG")
     buf.seek(0)
     return buf.getvalue()
 
-def warmup(url, sample): # To warmup the server
+# -------------------------------------------------------------
+# Single Stream Latency Test
+# -------------------------------------------------------------
+
+def single_stream_latency(url, image, iterations=200):
+    img_bytes = image_to_bytes(image)
+    latencies = []
+
+    print("\n=== Running Single Stream Latency Benchmark ===")
+
+    # Warmup
     for _ in range(5):
-        requests.post(url, files={"image": ("warmup.jpg", image_to_bytes(sample), "image/jpeg")})
+        requests.post(url, files={"image": ("warmup.jpg", img_bytes, "image/jpeg")})
 
-def benchmark_per_request(url, images):
-    warmup(url, images[0])
+    # Actual test
+    for _ in range(iterations):
+        start = time.perf_counter()
+        r = requests.post(url, files={"image": ("img.jpg", img_bytes, "image/jpeg")})
+        r.raise_for_status()
+        latencies.append((time.perf_counter() - start) * 1000)
 
-    latencies = []
-    for image in images:
-        img_bytes = image_to_bytes(image)
-        start = time.time()
-        response = requests.post(url, files={"image": ("img.jpg", img_bytes, "image/jpeg")})
-        response.raise_for_status()
-        latencies.append(time.time() - start)
+    latencies = np.array(latencies)
 
-    return {"latency_90th_percentile": np.percentile(latencies, 90),
-            "average_latency": np.mean(latencies),
-            "throughput_img_per_sec": len(images) / sum(latencies)}
-
-
-def benchmark_batch(url, images, batch_size):
-    warmup(url, images[0])
-    latencies = []
-    total = 0
-
-    for i in range(0, len(images), batch_size):
-        batch = images[i:i+batch_size]
-
-        start = time.time()
-        for image in batch:
-            response = requests.post(url, files={"image": ("img.jpg", image_to_bytes(image), "image/jpeg")})
-            response.raise_for_status()
-
-        elapsed = time.time() - start
-        latencies.append(elapsed)
-        total += len(batch)
-
-    mean_latency = np.mean(latencies)
-
-
-    return {
-        "batch": batch_size,
-        "latency_per_request": mean_latency,
-        "latency_per_image": mean_latency / batch_size,
-        "throughput_img_per_sec": total / sum(latencies),
+    results = {
+        "iterations": iterations,
+        "avg_ms": float(latencies.mean()),
+        "p50_ms": float(np.percentile(latencies, 50)),
+        "p90_ms": float(np.percentile(latencies, 90)),
+        "p99_ms": float(np.percentile(latencies, 99)),
+        "min_ms":  float(latencies.min()),
+        "max_ms":  float(latencies.max()),
     }
 
+    print("=== Single Stream Latency Results ===")
+    for k, v in results.items():
+        print(f"{k}: {v}")
+
+    return results
+
+# -------------------------------------------------------------
+# Concurrency Scaling Test
+# -------------------------------------------------------------
+
+async def run_worker(url, img_bytes, iterations):
+    lat = []
+    async with aiohttp.ClientSession() as session:
+        for _ in range(iterations):
+            start = time.perf_counter()
+            async with session.post(url, data={"image": img_bytes}) as resp:
+                await resp.read()
+            lat.append((time.perf_counter() - start) * 1000)
+    return lat
+
+async def concurrency_test(url, image, concurrency, iterations):
+    img_bytes = image_to_bytes(image)
+
+    workers = [run_worker(url, img_bytes, iterations) for _ in range(concurrency)]
+    results = await asyncio.gather(*workers)
+    latencies = np.concatenate(results)
+
+    total_requests = concurrency * iterations
+    tot_sec = np.sum(latencies) / 1000
+
+    out = {
+        "concurrency": concurrency,
+        "iterations_per_worker": iterations,
+        "total_requests": total_requests,
+        "throughput_img_per_sec": total_requests / tot_sec,
+        "avg_ms": float(latencies.mean()),
+        "p90_ms": float(np.percentile(latencies, 90)),
+        "p99_ms": float(np.percentile(latencies, 99)),
+    }
+
+    print(f"\n=== Concurrency = {concurrency} ===")
+    for k, v in out.items():
+        print(f"{k}: {v}")
+
+    return out
+
+# -------------------------------------------------------------
+# Main Benchmark Runner
+# -------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--folder", required=True, help="folder with images")
-    parser.add_argument("--sizes", nargs="+", type=int, default=[1, 2, 4, 8, 16])
+    parser.add_argument("--folder", required=True, help="Folder with images (COCO val2017)")
     parser.add_argument("--url", default="http://localhost:3000/detect")
+    parser.add_argument("--single_iter", type=int, default=200)
+    parser.add_argument("--concurrency_levels", nargs="+", type=int, default=[1, 2, 4, 8])
+    parser.add_argument("--concurrency_iter", type=int, default=50)
     args = parser.parse_args()
 
+    # Load dataset
     images = load_images(args.folder)
-    print(f"Loaded {len(images)} images")
+    if len(images) == 0:
+        print("No images loaded.")
+        sys.exit(1)
 
-    results = []
-    results_batch = []
+    # Single fixed image for fair comparison
+    image = images[0]
+    print(f"Loaded 1 image for testing from dataset: {args.folder}")
 
-    for bs in args.sizes:
-        r = benchmark_batch(args.url, images, bs)
-        results_batch.append(r)
-
-    print("\n=== One Sample Request Benchmark Results ===")
-    res = benchmark_per_request(args.url, images)
-
-    print(
-        f"Lat 90th perc.: {res['latency_90th_percentile']*1000:6.1f} ms | "
-        f"Avg Lat: {res['average_latency']*1000:6.1f} ms | "
-        f"Throughput: {res['throughput_img_per_sec']:8.1f} img/s"
+    # ---------------- Single Stream -------------------
+    single_results = single_stream_latency(
+        url=args.url,
+        image=image,
+        iterations=args.single_iter
     )
-    print("\n")
-    
 
-    print("\n=== Batch Benchmark Results ===")
-    for r in results_batch:
-        print(
-            f"Batch {r['batch']:>2d} | "
-            f"Lat/req: {r['latency_per_request']*1000:6.1f} ms | "
-            f"Lat/img: {r['latency_per_image']*1000:6.1f} ms | "
-            f"Throughput: {r['throughput_img_per_sec']:8.1f} img/s"
+    # ---------------- Concurrency ---------------------
+    print("\n=== Running Concurrency Scaling Benchmark ===")
+    all_concurrency_results = []
+
+    for c in args.concurrency_levels:
+        res = asyncio.run(
+            concurrency_test(
+                url=args.url,
+                image=image,
+                concurrency=c,
+                iterations=args.concurrency_iter
+            )
         )
-
+        all_concurrency_results.append(res)
 
 if __name__ == "__main__":
     main()
