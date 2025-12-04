@@ -26,7 +26,7 @@ Using Python/conda virtual environment
    - Create the virtual environment, activate it and install dependencies specified in requirements.txt
    - Open two terminals and
       - on one terminal, run bento server with command ``bentoml serve``
-      - on the other terminal, run benchmark file e.g., ``python benchmark.py --folder "coco-dataset/val2017" ``
+      - on the other terminal, run benchmark file e.g., ``python benchmark.py --folder "data/coco-dataset/val2017" ``
 
 
   
