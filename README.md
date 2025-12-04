@@ -21,12 +21,20 @@ For the evaluations, a [coco-dataset](https://cocodataset.org/#download) will be
 
 
 ## Running the code
-Using Python/conda virtual environment
+1. Using Python/conda virtual environment
    - Clone repository
    - Create the virtual environment, activate it and install dependencies specified in requirements.txt
    - Open two terminals and
       - on one terminal, run bento server with command ``bentoml serve``
       - on the other terminal, run benchmark file e.g., ``python benchmark.py --folder "data/coco-dataset/val2017" ``
+        
+2. Using Docker
+   - Clone repository
+   - Build docker image: ``docker build -t yolo11-bento .``
+   - Run BentoML service: ``docker run -p 3000:3000 yolo11-bento``
+   - Run benchmark file inside the container: `` docker run --rm yolo11-bento \
+    python benchmark.py --folder data/coco-dataset/val2017 --url http://host.docker.internal:3000/detect``
+      - on the other terminal, run benchmark file e.g., ``python benchmark.py --folder "coco-dataset/val2017" ``
 
 
   
